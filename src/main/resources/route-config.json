@@ -1,0 +1,19 @@
+{
+  "global": {
+    "failureRestEndpoint": "http://host:3000/api"
+  },
+  "systems": [
+    {
+      "systemName": "SystemA",
+      "weblogicConnectionFactory": "TargetCF",
+      "routes": [
+        {
+          "rabbitSourceQueue": "test_q",
+          "rabbitExchangeName": "test_exchange",
+          "rabbitRoutingKey": "test_rkey",
+          "weblogicDestination": "TargetQ"
+        }
+      ]
+    }
+  ]
+}
