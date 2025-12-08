@@ -11,8 +11,8 @@ public class CamelServletConfig {
     // IMPORTANT: The name of this bean MUST match the component name in restConfiguration()
     // It is critical that the name is "servlet"
     @Bean
-    public ServletRegistrationBean camelServlet() {
-        ServletRegistrationBean registration = new ServletRegistrationBean(
+    public ServletRegistrationBean<CamelHttpTransportServlet> camelServlet() {
+        ServletRegistrationBean<CamelHttpTransportServlet> registration = new ServletRegistrationBean<>(
                 new CamelHttpTransportServlet() // The actual Camel servlet class
         );
         registration.setName("servlet"); // Set the bean name to "servlet"

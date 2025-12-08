@@ -1,122 +1,92 @@
 package com.muhammadallee.cameldemo;
 
+
+import com.lmax.disruptor.RingBuffer;
 import org.apache.camel.Exchange;
 import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.component.jms.JmsComponent;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jms.support.destination.JndiDestinationResolver;
 import org.springframework.stereotype.Component;
 
 import javax.jms.ConnectionFactory;
-import javax.jms.JMSException;
 import java.util.Map;
+import java.util.UUID;
 
 @Component
 public class MediatorRouteBuilder extends RouteBuilder {
 
-    @Autowired
-    MediatorConfig config;
+    private final DisruptorPublisher disruptorPublisher;
+    private final Map<String, ConnectionFactory> weblogicCFs;
 
-    @Autowired
-    RabbitProperties rabbitProps;
+    public MediatorRouteBuilder(
+            RingBuffer<FailureEvent> ringBuffer,
+            Map<String, ConnectionFactory> weblogicCFs) {
 
-    @Autowired
-    Map<String, ConnectionFactory> weblogicCFs;
+        this.disruptorPublisher = new DisruptorPublisher(ringBuffer);
+        this.weblogicCFs = weblogicCFs;
+    }
 
     @Override
-    public void configure() throws Exception {
+    public void configure() {
 
-        // -------------------------------------------------------------------
-        // 1. GLOBAL EXCEPTION HANDLER — MUST COME FIRST!
-        // -------------------------------------------------------------------
-        onException(JMSException.class)
-                .maximumRedeliveries(0)
+        // ---------------- GLOBAL FAILURE HANDLER ----------------
+        onException(Exception.class)
                 .handled(true)
+                .maximumRedeliveries(0)
+                .process(exchange -> {
 
-                // async REST call
-                .wireTap("seda:notifyFailure")
-                // send to DLQ dynamically
-//                .toD("rabbitmq://"
-//                        + "${header.rabbitHost}"
-//                        + ":" + "${header.rabbitPort}"
-//                        + "/" + "${header.dlqName}"
-//                        + "?username=${header.rabbitUser}"
-//                        + "&password=${header.rabbitPass}"
-//                        //+ "&vhost=${header.rabbitVhost}"
-//                )
-                .log("Failed to enqueue to WebLogic. Routed to DLQ ${header.dlqName}");
+                    String bridgeId = exchange.getIn()
+                            .getHeader("BridgeId", String.class);
 
-        // -------------------------------------------------------------------
-        // async REST notification route
-        // -------------------------------------------------------------------
-        from("seda:notifyFailure")
-                .routeId("asyncFailureNotifier")
-                .setHeader(Exchange.CONTENT_TYPE, constant("application/json"))
-                .doTry()
-                .toD("${header.failureRestUrl}?httpMethod=POST&throwExceptionOnFailure=false")
-                .doCatch(Exception.class)
-                .log("Async REST call failed: ${exception.message}")
-                .end();
+                    if (bridgeId == null) {
+                        bridgeId = UUID.randomUUID().toString();
+                        exchange.getIn().setHeader("BridgeId", bridgeId);
+                    }
 
+                    Exception ex = exchange.getProperty(
+                            Exchange.EXCEPTION_CAUGHT, Exception.class);
 
-        // -------------------------------------------------------------------
-        // 2. NOW YOU CAN DEFINE ROUTES
-        // -------------------------------------------------------------------
-        for (SystemConfig sys : config.getSystems()) {
+                    FailureEvent failureEvent = new FailureEvent();
+                    failureEvent.bridgeId = bridgeId;
+                    failureEvent.timestampNanos = System.nanoTime();
+                    failureEvent.sourceQueue = exchange.getIn()
+                            .getHeader("rabbitmq.QUEUE_NAME", String.class);
+                    failureEvent.targetQueue = exchange.getIn()
+                            .getHeader("jms.destination", String.class);
+                    failureEvent.payload = exchange.getIn().getBody(byte[].class);
+                    failureEvent.headers = exchange.getIn().getHeaders();
+                    failureEvent.errorMessage = ex != null ? ex.getMessage() : "UNKNOWN";
+                    failureEvent.exceptionType = ex != null ? ex.getClass().getName() : "UNKNOWN";
 
-            // create JMS component for this system
-            JmsComponent jms = JmsComponent.jmsComponent(weblogicCFs.get(sys.getSystemName()));
+                    disruptorPublisher.publish(failureEvent);
+
+                    RabbitMQHelper.nackWithoutRequeue(exchange);
+                });
+
+        // ---------------- JMS COMPONENT ----------------
+        weblogicCFs.forEach((name, cf) -> {
+            JmsComponent jms = JmsComponent.jmsComponent(cf);
             jms.setDestinationResolver(new JndiDestinationResolver());
-            getContext().addComponent("jms-" + sys.getSystemName(), jms);
+            getContext().addComponent("jms-" + name, jms);
+        });
 
-            for (RouteConfig route : sys.getRoutes()) {
+        // ---------------- MAIN ROUTE ----------------
+        from("rabbitmq://localhost:5672/exchange?"
+                + "queue=SOURCE_Q"
+                + "&autoAck=false"
+                + "&prefetchCount=500")
+                .routeId("rabbit-to-weblogic")
 
-                String rabbitUri = String.format(
-                        "rabbitmq://%s:%d/%s?queue=%s&username=%s&password=%s&routingKey=%s&autoAck=false&autoDelete=false",
-                        rabbitProps.getHost(),
-                        rabbitProps.getPort(),
-                        route.getRabbitExchangeName(), // <-- Use a real or default exchange name (e.g., 'default' or an empty string)
-                        route.getRabbitSourceQueue(), // <-- Queue name is passed as the 'queue' parameter
-                        rabbitProps.getUsername(),
-                        rabbitProps.getPassword(),
-                        route.getRabbitRoutingKey() // <-- Include routing key
-                );
+                .process(e -> {
+                    e.getIn().setHeader("BridgeId",
+                            UUID.randomUUID().toString());
+                })
 
-//                String rabbitUri = String.format(
-//                        "rabbitmq://%s:%d/%s?username=%s&password=%s&autoAck=false",
-//                        rabbitProps.getHost(),
-//                        rabbitProps.getPort(),
-//                        route.getRabbitExchangeName(),
-//                        route.getRabbitSourceQueue(),
-//                        rabbitProps.getUsername(),
-//                        rabbitProps.getPassword()
-//                        //,rabbitProps.getVirtualHost()
-//                );
+                // Persistent JMS send
+                .to("jms:queue:TARGET_Q"
+                        + "?deliveryPersistent=true")
 
-                String dlqName = route.getRabbitSourceQueue() + rabbitProps.getDlqSuffix();
-
-                from(rabbitUri)
-                        .routeId("route_" + sys.getSystemName() + "_" + route.getRabbitSourceQueue())
-
-                        // set headers used by exception handler
-                        //.setHeader("dlqName", constant(dlqName))
-                        .setHeader("failureRestUrl", constant(config.getGlobal().getFailureRestEndpoint()))
-                        .setHeader("rabbitHost", constant(rabbitProps.getHost()))
-                        .setHeader("rabbitPort", constant(rabbitProps.getPort()))
-                        .setHeader("rabbitUser", constant(rabbitProps.getUsername()))
-                        .setHeader("rabbitPass", constant(rabbitProps.getPassword()))
-                        //.setHeader("rabbitVhost", constant(rabbitProps.getVirtualHost()))
-
-                        .log("Received message from " + route.getRabbitSourceQueue())
-
-                        // WebLogic enqueue
-                        .to("jms-" + sys.getSystemName() + ":queue:" + route.getWeblogicDestination())
-
-                        .log("Forwarded to WebLogic queue " + route.getWeblogicDestination())
-
-                        // manual ack
-                        .setHeader("rabbitmq.ack", constant(true));
-            }
-        }
+                // ACK only after JMS success
+                .process(RabbitMQHelper::ack);
     }
 }

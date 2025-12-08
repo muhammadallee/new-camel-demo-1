@@ -11,7 +11,27 @@
           "rabbitSourceQueue": "test_q",
           "rabbitExchangeName": "test_exchange",
           "rabbitRoutingKey": "test_rkey",
-          "weblogicDestination": "TargetQ"
+          "weblogicDestination": "TargetQ",
+          "concurrentConsumers": 5,
+          "maxConcurrentConsumers": 15,
+          "prefetchCount": 20,
+          "threadPoolSize": 30,
+          "channelCacheSize": 25,
+
+          "durable": true,
+          "exclusive": false,
+          "autoDelete": false,
+
+          "dlqName": "test_q.dlq",
+          "dlxName": "test_q.dlx",
+          "dlqRoutingKey": "test_q.dlq",
+
+          "retryPolicy": {
+            "rabbitRequeue": true,
+            "redisMaxRetries": 50,
+            "redisBackoffMs": 15000,
+            "dlqAfterRetries": true
+          }
         }
       ]
     }
