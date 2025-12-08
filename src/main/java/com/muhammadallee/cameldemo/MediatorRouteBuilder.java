@@ -26,95 +26,105 @@ public class MediatorRouteBuilder extends RouteBuilder {
     @Override
     public void configure() throws Exception {
 
-        // -------------------------------------------------------------------
-        // 1. GLOBAL EXCEPTION HANDLER — MUST COME FIRST!
-        // -------------------------------------------------------------------
+        // ================================================================
+        // GLOBAL EXCEPTION HANDLER
+        // ================================================================
         onException(JMSException.class)
                 .maximumRedeliveries(0)
                 .handled(true)
-
-                // async REST call
                 .wireTap("seda:notifyFailure")
-                // send to DLQ dynamically
-//                .toD("rabbitmq://"
-//                        + "${header.rabbitHost}"
-//                        + ":" + "${header.rabbitPort}"
-//                        + "/" + "${header.dlqName}"
-//                        + "?username=${header.rabbitUser}"
-//                        + "&password=${header.rabbitPass}"
-//                        //+ "&vhost=${header.rabbitVhost}"
-//                )
-                .log("Failed to enqueue to WebLogic. Routed to DLQ ${header.dlqName}");
+                .log("Failed to enqueue to WebLogic for message from RabbitMQ");
 
-        // -------------------------------------------------------------------
-        // async REST notification route
-        // -------------------------------------------------------------------
+        // ================================================================
+        // ASYNC FAILURE NOTIFIER
+        // ================================================================
         from("seda:notifyFailure")
                 .routeId("asyncFailureNotifier")
                 .setHeader(Exchange.CONTENT_TYPE, constant("application/json"))
-                .doTry()
-                .toD("${header.failureRestUrl}?httpMethod=POST&throwExceptionOnFailure=false")
-                .doCatch(Exception.class)
-                .log("Async REST call failed: ${exception.message}")
-                .end();
+                .toD("${header.failureRestUrl}?httpMethod=POST&throwExceptionOnFailure=false");
 
 
-        // -------------------------------------------------------------------
-        // 2. NOW YOU CAN DEFINE ROUTES
-        // -------------------------------------------------------------------
+        // ================================================================
+        // MAIN ROUTES
+        // ================================================================
         for (SystemConfig sys : config.getSystems()) {
 
-            // create JMS component for this system
+            // JMS component for WebLogic
             JmsComponent jms = JmsComponent.jmsComponent(weblogicCFs.get(sys.getSystemName()));
             jms.setDestinationResolver(new JndiDestinationResolver());
             getContext().addComponent("jms-" + sys.getSystemName(), jms);
 
             for (RouteConfig route : sys.getRoutes()) {
 
-                String rabbitUri = String.format(
-                        "rabbitmq://%s:%d/%s?queue=%s&username=%s&password=%s&routingKey=%s&autoAck=false&autoDelete=false",
+                // ============================================================
+                // BUILD RABBITMQ URI FROM ROUTE-LEVEL TUNING
+                // ============================================================
+                String rabbitUri =
+                        "rabbitmq://%s:%d/%s"
+                                + "?queue=%s"
+                                + "&username=%s"
+                                + "&password=%s"
+                                + "&routingKey=%s"
+                                + "&autoAck=false"
+                                + "&acknowledgeMode=MANUAL"
+                                + "&automaticRecoveryEnabled=true"
+
+                                // tuning parameters
+                                + "&concurrentConsumers=%d"
+                                + "&maxConcurrentConsumers=%d"
+                                + "&prefetchCount=%d"
+                                + "&threadPoolSize=%d"
+                                + "&channelCacheSize=%d"
+
+                                // queue/exchange flags
+                                + "&queueDurable=%b"
+                                + "&exchangeDurable=%b"
+                                + "&autoDelete=%b"
+
+                                // DLX/DLQ
+                                + "&deadLetterExchange=%s"
+                                + "&deadLetterRoutingKey=%s";
+
+                rabbitUri = String.format(
+                        rabbitUri,
                         rabbitProps.getHost(),
                         rabbitProps.getPort(),
-                        route.getRabbitExchangeName(), // <-- Use a real or default exchange name (e.g., 'default' or an empty string)
-                        route.getRabbitSourceQueue(), // <-- Queue name is passed as the 'queue' parameter
+                        route.getRabbitExchangeName(),
+                        route.getRabbitSourceQueue(),
                         rabbitProps.getUsername(),
                         rabbitProps.getPassword(),
-                        route.getRabbitRoutingKey() // <-- Include routing key
+                        route.getRabbitRoutingKey(),
+
+                        // tuning
+                        route.getConcurrentConsumers(),
+                        route.getMaxConcurrentConsumers(),
+                        route.getPrefetchCount(),
+                        route.getThreadPoolSize(),
+                        route.getChannelCacheSize(),
+
+                        // queue flags
+                        route.isDurable(),
+                        route.isDurable(),
+                        route.isAutoDelete(),
+
+                        // DLX/DLQ
+                        route.getDlxName(),
+                        route.getDlqRoutingKey()
                 );
 
-//                String rabbitUri = String.format(
-//                        "rabbitmq://%s:%d/%s?username=%s&password=%s&autoAck=false",
-//                        rabbitProps.getHost(),
-//                        rabbitProps.getPort(),
-//                        route.getRabbitExchangeName(),
-//                        route.getRabbitSourceQueue(),
-//                        rabbitProps.getUsername(),
-//                        rabbitProps.getPassword()
-//                        //,rabbitProps.getVirtualHost()
-//                );
-
-                String dlqName = route.getRabbitSourceQueue() + rabbitProps.getDlqSuffix();
-
+                // ============================================================
+                // ROUTE: RABBITMQ -> WEBLOGIC JMS
+                // ============================================================
                 from(rabbitUri)
                         .routeId("route_" + sys.getSystemName() + "_" + route.getRabbitSourceQueue())
 
-                        // set headers used by exception handler
-                        //.setHeader("dlqName", constant(dlqName))
-                        .setHeader("failureRestUrl", constant(config.getGlobal().getFailureRestEndpoint()))
-                        .setHeader("rabbitHost", constant(rabbitProps.getHost()))
-                        .setHeader("rabbitPort", constant(rabbitProps.getPort()))
-                        .setHeader("rabbitUser", constant(rabbitProps.getUsername()))
-                        .setHeader("rabbitPass", constant(rabbitProps.getPassword()))
-                        //.setHeader("rabbitVhost", constant(rabbitProps.getVirtualHost()))
+                        .log("Received message from RabbitMQ queue: " + route.getRabbitSourceQueue())
 
-                        .log("Received message from " + route.getRabbitSourceQueue())
-
-                        // WebLogic enqueue
                         .to("jms-" + sys.getSystemName() + ":queue:" + route.getWeblogicDestination())
 
-                        .log("Forwarded to WebLogic queue " + route.getWeblogicDestination())
+                        .log("Forwarded to WebLogic queue: " + route.getWeblogicDestination())
 
-                        // manual ack
+                        // MANUAL ACK
                         .setHeader("rabbitmq.ack", constant(true));
             }
         }
