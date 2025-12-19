@@ -2,6 +2,7 @@ package com.muhammadallee.cameldemo;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.jms.connection.CachingConnectionFactory;
 import org.springframework.jms.connection.UserCredentialsConnectionFactoryAdapter;
 
 import javax.jms.ConnectionFactory;
@@ -24,8 +25,10 @@ public class WeblogicConnectionFactoryConfig {
             ConnectionFactory cf =
                     (ConnectionFactory) ctx.lookup(sys.getWeblogicConnectionFactory());
 
-            //ConnectionFactory targetCF = getTargetConnectionFactory(cf);
-            factories.put(sys.getSystemName(), cf);
+            CachingConnectionFactory ccf = new CachingConnectionFactory(cf);
+            ccf.setSessionCacheSize(10);
+            ccf.setCacheConsumers(false);
+            factories.put(sys.getSystemName(), ccf);
         }
         return factories;
     }

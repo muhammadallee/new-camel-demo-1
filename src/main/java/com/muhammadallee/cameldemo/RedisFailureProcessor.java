@@ -8,36 +8,41 @@ import org.springframework.stereotype.Component;
 @Component
 public class RedisFailureProcessor {
 
-    private final RedisCommands<String, String> redis;
+    private final RedisFailureStore redisStore;
     private final DlqPublisher dlqPublisher;
 
-    public RedisFailureProcessor(StatefulRedisConnection<String, String> conn,
+    private final String NODE_ID = System.getenv().getOrDefault("HOSTNAME", "local");
+
+    public RedisFailureProcessor(RedisFailureStore rediStore,
                                  DlqPublisher dlqPublisher) {
-        this.redis = conn.sync();
+        this.redisStore = rediStore;
         this.dlqPublisher = dlqPublisher;
     }
 
-    @Scheduled(fixedDelay = 3000) // TODO: Quartz - for cluster awareness? and make it configurable
+    @Scheduled(fixedDelay = 3000)
     public void process() {
 
-        for (int i = 0; i < 500; i++) {
+        String queueKey = "bridge:pending:source";
+        String sourceQueue = "source"; // resolve dynamically if needed
+        String bridgeId = redisStore.popPending(sourceQueue);
+        if (bridgeId == null) return;
 
-            String bridgeId = redis.rpop("bridge:failure:queue");
-            if (bridgeId == null) return;
+        FailureEvent event = redisStore.load(bridgeId);
+        if (event == null) return;
 
-            String key = "bridge:failure:" + bridgeId;
+        try {
+            // call REST retry endpoint here
+            throw new RuntimeException("Simulated REST failure");
 
-            try {
-                // TODO: REST call here
-                redis.del(key);
-            } catch (Exception e) {
-                long retry = redis.hincrby(key, "retryCount", 1);
-                if (retry > 50) {
-                    dlqPublisher.publish("DLQ", redis.hget(key, "payload").getBytes());
-                    redis.del(key);
-                } else {
-                    redis.lpush("bridge:failure:queue", bridgeId);
-                }
+        } catch (Exception e) {
+
+            boolean retryAllowed = redisStore.incrementRetry(event);
+
+            if (retryAllowed) {
+                redisStore.requeue(event);
+            } else {
+                dlqPublisher.publish(event);
+                redisStore.markInDlq(bridgeId);
             }
         }
     }

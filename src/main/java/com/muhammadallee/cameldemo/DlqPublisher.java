@@ -1,26 +1,31 @@
 package com.muhammadallee.cameldemo;
 
+import org.apache.camel.ProducerTemplate;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.stereotype.Component;
 
 import javax.jms.BytesMessage;
+import javax.jms.Message;
+import javax.jms.TextMessage;
 
 @Component
 public class DlqPublisher {
 
-    private final JmsTemplate jmsTemplate;
+    //private final JmsTemplate jmsTemplate;
 
-    public DlqPublisher(JmsTemplate jmsTemplate) {
-        this.jmsTemplate = jmsTemplate;
+    private final ProducerTemplate producerTemplate;
+
+    public DlqPublisher(ProducerTemplate producerTemplate) {
+        this.producerTemplate = producerTemplate;
     }
 
-    public void publish(String dlqName, byte[] payload) {
-        jmsTemplate.send(dlqName,
-                session -> {
-                    BytesMessage msg = session.createBytesMessage();
-                    msg.writeBytes(payload);
-                    return msg;
-                }
+    public void publish(FailureEvent event) {
+        producerTemplate.sendBodyAndHeaders(
+                "rabbitmq://dlq-exchange"
+                        + "?queue=DLQ"
+                        + "&autoAck=true",
+                event.getPayload(),
+                event.getHeaders()
         );
     }
 }

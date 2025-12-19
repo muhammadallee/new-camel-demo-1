@@ -16,7 +16,7 @@ public class FailureEventHandler implements EventHandler<FailureEvent> {
 
     public void onEvent(FailureEvent e, long seq, boolean end) {
         try {
-            redis.store(e);
+            redis.persist(e);
         } catch (Exception ex) {
             disk.append(e);
         }

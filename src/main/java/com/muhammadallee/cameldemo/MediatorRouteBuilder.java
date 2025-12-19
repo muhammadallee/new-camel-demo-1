@@ -1,10 +1,10 @@
 package com.muhammadallee.cameldemo;
 
-
-import com.lmax.disruptor.RingBuffer;
-import org.apache.camel.Exchange;
+import org.apache.camel.CamelContext;
 import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.component.jms.JmsComponent;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jms.connection.CachingConnectionFactory;
 import org.springframework.jms.support.destination.JndiDestinationResolver;
 import org.springframework.stereotype.Component;
 
@@ -15,78 +15,82 @@ import java.util.UUID;
 @Component
 public class MediatorRouteBuilder extends RouteBuilder {
 
-    private final DisruptorPublisher disruptorPublisher;
-    private final Map<String, ConnectionFactory> weblogicCFs;
+    @Autowired
+    private RedisFailureStore redisRepo;
 
-    public MediatorRouteBuilder(
-            RingBuffer<FailureEvent> ringBuffer,
-            Map<String, ConnectionFactory> weblogicCFs) {
+    @Autowired
+    private DiskFailureStore diskStore;
 
-        this.disruptorPublisher = new DisruptorPublisher(ringBuffer);
-        this.weblogicCFs = weblogicCFs;
-    }
+    @Autowired
+    private  Map<String, ConnectionFactory> weblogicCFs;
+
+    @Autowired
+    MediatorConfig mediatorConfig;
+
 
     @Override
     public void configure() {
 
-        // ---------------- GLOBAL FAILURE HANDLER ----------------
         onException(Exception.class)
                 .handled(true)
-                .maximumRedeliveries(0)
                 .process(exchange -> {
 
-                    String bridgeId = exchange.getIn()
-                            .getHeader("BridgeId", String.class);
-
-                    if (bridgeId == null) {
-                        bridgeId = UUID.randomUUID().toString();
-                        exchange.getIn().setHeader("BridgeId", bridgeId);
+                    if (Boolean.TRUE.equals(exchange.getProperty("ACKED"))) {
+                        return;
                     }
 
-                    Exception ex = exchange.getProperty(
-                            Exchange.EXCEPTION_CAUGHT, Exception.class);
+                    String bridgeId = UUID.randomUUID().toString();
+                    exchange.setProperty("bridgeId", bridgeId);
 
-                    FailureEvent failureEvent = new FailureEvent();
-                    failureEvent.bridgeId = bridgeId;
-                    failureEvent.timestampNanos = System.nanoTime();
-                    failureEvent.sourceQueue = exchange.getIn()
-                            .getHeader("rabbitmq.QUEUE_NAME", String.class);
-                    failureEvent.targetQueue = exchange.getIn()
-                            .getHeader("jms.destination", String.class);
-                    failureEvent.payload = exchange.getIn().getBody(byte[].class);
-                    failureEvent.headers = exchange.getIn().getHeaders();
-                    failureEvent.errorMessage = ex != null ? ex.getMessage() : "UNKNOWN";
-                    failureEvent.exceptionType = ex != null ? ex.getClass().getName() : "UNKNOWN";
+                    FailureEvent event = FailureEvent.fromExchange(exchange, bridgeId);
 
-                    disruptorPublisher.publish(failureEvent);
+                    boolean persisted = false;
+                    try {
+                        redisRepo.persist(event);
+                        persisted = true;
+                    } catch (Exception redisEx) {
+                        diskStore.append(event);
+                        persisted = true;
+                    }
 
-                    RabbitMQHelper.nackWithoutRequeue(exchange);
+                    if (persisted) {
+                        RabbitMQHelper.nackWithoutRequeue(exchange);
+                        exchange.setProperty("ACKED", true);
+                    }
                 });
 
-        // ---------------- JMS COMPONENT ----------------
         weblogicCFs.forEach((name, cf) -> {
             JmsComponent jms = JmsComponent.jmsComponent(cf);
             jms.setDestinationResolver(new JndiDestinationResolver());
             getContext().addComponent("jms-" + name, jms);
         });
 
-        // ---------------- MAIN ROUTE ----------------
-        from("rabbitmq://localhost:5672/exchange?"
-                + "queue=SOURCE_Q"
-                + "&autoAck=false"
-                + "&prefetchCount=500")
-                .routeId("rabbit-to-weblogic")
+        for (SystemConfig system : mediatorConfig.getSystems()) {
+            for (RouteConfig route : system.getRoutes()) {
+                setWLRoute(system, route);
+            }
+        }
 
-                .process(e -> {
-                    e.getIn().setHeader("BridgeId",
+    }
+
+    private void setWLRoute(SystemConfig system, RouteConfig route) {
+        from("rabbitmq://localhost:5672/" + route.getRabbitExchangeName()
+                + "?queue=" + route.getRabbitSourceQueue()
+                + "&autoAck=false&autoDelete=false")
+                .routeId("rabbit-to-wls-" + system.getSystemName())
+                .process(exchange -> {
+                    exchange.getIn().setHeader("bridgeId",
                             UUID.randomUUID().toString());
                 })
-
-                // Persistent JMS send
-                .to("jms:queue:TARGET_Q"
+                .to("jms-" + system.getSystemName()
+                        + ":queue:" + route.getWeblogicDestination()
                         + "?deliveryPersistent=true")
+                .process(exchange -> {
 
-                // ACK only after JMS success
-                .process(RabbitMQHelper::ack);
+                    if (!Boolean.TRUE.equals(exchange.getProperty("ACKED"))) {
+                        RabbitMQHelper.ack(exchange);
+                        exchange.setProperty("ACKED", true);
+                    }
+                });
     }
 }

@@ -1,46 +1,75 @@
 package com.muhammadallee.cameldemo;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import io.lettuce.core.api.StatefulRedisConnection;
-import io.lettuce.core.api.sync.RedisCommands;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.time.Duration;
 
 @Component
 public class RedisFailureStore {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final int TTL_SECONDS = 30 * 24 * 60 * 60;
+    private final RedisTemplate<String, Object> redis;
+    private static final int MAX_RETRIES = 5;
 
-    private final RedisCommands<String, String> redis;
 
-    public RedisFailureStore(StatefulRedisConnection<String, String> conn) {
-        this.redis = conn.sync();
+    public RedisFailureStore(RedisTemplate<String, Object> redis) {
+        this.redis = redis;
     }
 
-    public void store(FailureEvent event) throws Exception {
+    public void persist(FailureEvent event) {
+        String eventKey = eventKey(event.getBridgeId());
+        redis.opsForValue().set(eventKey, event);
+        redis.expire(eventKey, Duration.ofDays(30));
 
+        redis.opsForList().leftPush(
+                pendingQueue(event.getSourceQueue()),
+                event.getBridgeId()
+        );
+    }
 
-        String key = "bridge:failure:" + event.getBridgeId();
+    /* ---------------- Load ---------------- */
 
-        Map<String, String> map = new HashMap<>();
-        map.put("payload", MAPPER.writeValueAsString(event.getPayload()));
-        map.put("headers", MAPPER.writeValueAsString(event.getHeaders()));
-        map.put("sourceQueue", event.getSourceQueue());
-        map.put("targetQueue", event.getTargetQueue());
-        map.put("error", event.getErrorMessage());
-        map.put("retryCount", "0");
+    public FailureEvent load(String bridgeId) {
+        return (FailureEvent) redis.opsForValue()
+                .get(eventKey(bridgeId));
+    }
 
-        // HSET bridge:failures <bridgeId> <json>
-        // LPUSH bridge:queue <bridgeId>
-        // EXPIRE bridge:failures 2592000
-        redis.multi();
-        redis.hmset(key, map);
-        redis.expire(key, TTL_SECONDS);
-        redis.lpush("bridge:failure:queue", event.getBridgeId());
-        redis.exec();
+    /* ---------------- Retry Logic ---------------- */
+
+    public boolean incrementRetry(FailureEvent event) {
+        event.incrementRetry();
+        redis.opsForValue().set(eventKey(event.getBridgeId()), event);
+        return event.getRetryCount() <= MAX_RETRIES;
+    }
+
+    /* ---------------- Queue Ops ---------------- */
+
+    public String popPending(String sourceQueue) {
+        Object v = redis.opsForList()
+                .rightPop(pendingQueue(sourceQueue));
+        return v == null ? null : v.toString();
+    }
+
+    public void requeue(FailureEvent event) {
+        redis.opsForList().leftPush(
+                pendingQueue(event.getSourceQueue()),
+                event.getBridgeId()
+        );
+    }
+
+    /* ---------------- Final State ---------------- */
+
+    public void markInDlq(String bridgeId) {
+        redis.opsForSet().add("bridge:dlq", bridgeId);
+    }
+
+    /* ---------------- Keys ---------------- */
+
+    private String eventKey(String bridgeId) {
+        return "bridge:event:" + bridgeId;
+    }
+
+    private String pendingQueue(String sourceQueue) {
+        return "bridge:pending:" + sourceQueue;
     }
 }
